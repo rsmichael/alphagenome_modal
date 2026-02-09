@@ -68,42 +68,128 @@ def download_model():
     os.environ["HF_HOME"] = str(cache_dir)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_dir)
 
+    print("=" * 70)
+    print("BEFORE DOWNLOAD - Volume Inspection")
+    print("=" * 70)
+
+    # Check environment variables
+    print(f"HF_HOME: {os.environ.get('HF_HOME')}")
+    print(f"HUGGINGFACE_HUB_CACHE: {os.environ.get('HUGGINGFACE_HUB_CACHE')}")
+    print(f"XDG_CACHE_HOME: {os.environ.get('XDG_CACHE_HOME', 'not set')}")
+
+    # List /models/ root
+    models_root = Path("/models")
+    if models_root.exists():
+        print(f"\nContents of {models_root}:")
+        for item in models_root.iterdir():
+            item_type = "DIR" if item.is_dir() else "FILE"
+            print(f"  [{item_type}] {item.name}")
+
+    # Check cache directory before download
+    if cache_dir.exists():
+        cache_files_before = list(cache_dir.glob("**/*"))
+        cache_files_list = [f for f in cache_files_before if f.is_file()]
+        print(f"\nCache dir exists with {len(cache_files_list)} files (before download):")
+        for f in cache_files_list[:10]:
+            size_mb = f.stat().st_size / (1024 * 1024)
+            print(f"  {f.relative_to(cache_dir)} ({size_mb:.2f} MB)")
+
     # Authenticate with HuggingFace
     token = os.environ.get("HF_TOKEN")
     if not token:
         return "ERROR: HF_TOKEN not found. Create Modal secret first."
 
-    print(f"Authenticating with HuggingFace (token: {token[:10]}...)")
+    print(f"\nAuthenticating with HuggingFace (token: {token[:10]}...)")
     login(token=token)
 
-    # Check if model already exists in cache
-    cache_files = list(cache_dir.glob("**/*"))
-    if len(cache_files) > 10:  # Some files already cached
-        print(f"Found {len(cache_files)} cached files")
-        print("Model may already be downloaded")
-
-    # Download model using AlphaGenome's official method
-    print(f"Downloading AlphaGenome model to {cache_dir}...")
+    # Download model using explicit local download
+    print("\n" + "=" * 70)
+    print("DOWNLOADING MODEL")
+    print("=" * 70)
+    print(f"Target cache directory: {cache_dir}")
     print("This may take a while depending on model size...")
 
     try:
+        from huggingface_hub import snapshot_download
         from alphagenome_research.model import dna_model
 
-        # Download model - this will cache to HF_HOME
-        model = dna_model.create_from_huggingface('all_folds')
+        # Explicitly download all files locally
+        print("Downloading all model files locally with snapshot_download...")
+        local_model_path = snapshot_download(
+            repo_id="google/alphagenome-all-folds",
+            cache_dir=str(cache_dir),
+            token=token,
+            local_files_only=False,
+            ignore_patterns=None,  # Download everything
+        )
+        print(f"✓ Model files downloaded to: {local_model_path}")
 
-        print("✓ Model downloaded successfully")
-        print(f"Model loaded into memory. Type: {type(model)}")
+        # Load model from the downloaded local path
+        print("Loading model from local files...")
+        model = dna_model.create(
+            checkpoint_path=local_model_path,
+            organism_settings=None,
+            device=None,
+        )
 
-        # Check what was downloaded
+        print("✓ Model loaded into memory")
+        print(f"Model type: {type(model)}")
+
+        print("\n" + "=" * 70)
+        print("AFTER DOWNLOAD - Volume Inspection")
+        print("=" * 70)
+
+        # Check entire /models/ tree
+        print(f"\nContents of {models_root}:")
+        for item in models_root.iterdir():
+            item_type = "DIR" if item.is_dir() else "FILE"
+            if item.is_file():
+                size_mb = item.stat().st_size / (1024 * 1024)
+                print(f"  [{item_type}] {item.name} ({size_mb:.2f} MB)")
+            else:
+                # Count files in subdirectory
+                try:
+                    subfiles = list(item.glob("**/*"))
+                    file_count = len([f for f in subfiles if f.is_file()])
+                    print(f"  [{item_type}] {item.name}/ ({file_count} files)")
+                except:
+                    print(f"  [{item_type}] {item.name}/")
+
+        # Check cache directory after download
         cache_files_after = list(cache_dir.glob("**/*"))
-        print(f"Total files in cache: {len(cache_files_after)}")
+        cache_files_list = [f for f in cache_files_after if f.is_file()]
+        print(f"\nCache directory: {len(cache_files_list)} files")
+        print("Sample of files (first 20):")
+        for f in cache_files_list[:20]:
+            try:
+                size_mb = f.stat().st_size / (1024 * 1024)
+                print(f"  {f.relative_to(cache_dir)} ({size_mb:.2f} MB)")
+            except:
+                print(f"  {f.relative_to(cache_dir)}")
+
+        # Look for large model files anywhere in /models/
+        print("\nSearching for large files (>10 MB) in /models/:")
+        large_files = []
+        for item in models_root.glob("**/*"):
+            if item.is_file():
+                size_mb = item.stat().st_size / (1024 * 1024)
+                if size_mb > 10:
+                    large_files.append((item, size_mb))
+
+        large_files.sort(key=lambda x: x[1], reverse=True)
+        for file_path, size_mb in large_files[:10]:
+            print(f"  {file_path.relative_to(models_root)} ({size_mb:.2f} MB)")
+
+        if not large_files:
+            print("  (No large files found)")
 
         # Commit volume to persist changes
+        print("\n" + "=" * 70)
         print("Committing volume to persist model...")
         model_volume.commit()
+        print("✓ Volume committed")
 
-        return f"SUCCESS: Model downloaded and cached ({len(cache_files_after)} files)"
+        return f"SUCCESS: Model downloaded. Cache has {len(cache_files_list)} files. Found {len(large_files)} large files in volume."
 
     except Exception as e:
         import traceback
@@ -163,10 +249,24 @@ def verify_model():
 
     try:
         print("Loading AlphaGenome model from cache...")
+        from huggingface_hub import snapshot_download
         from alphagenome_research.model import dna_model
 
-        # Load model from cache
-        model = dna_model.create_from_huggingface('all_folds')
+        # Find the downloaded model path
+        local_model_path = snapshot_download(
+            repo_id="google/alphagenome-all-folds",
+            cache_dir=str(cache_dir),
+            token=token,
+            local_files_only=True,  # Only use local files, don't download
+        )
+        print(f"Found model at: {local_model_path}")
+
+        # Load model from the local path
+        model = dna_model.create(
+            checkpoint_path=local_model_path,
+            organism_settings=None,
+            device=None,
+        )
 
         print("✓ Model loaded successfully")
         print(f"Model type: {type(model)}")
