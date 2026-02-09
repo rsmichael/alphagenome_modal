@@ -165,13 +165,240 @@ pixi run modal-run
 
 This will execute the basic hello world function on Modal's infrastructure.
 
+### Step 4: Run Inference API
+
+Once the model is downloaded, you can start the inference API:
+
+#### Option A: Temporary Endpoint (for testing)
+
+```bash
+pixi run serve-temp
+```
+
+This creates a temporary web endpoint that runs on Modal's H100 GPU. The endpoint:
+- Stays active while the command is running
+- Shuts down when you press Ctrl+C
+- Provides a URL you can use to make requests
+- Good for development and testing
+
+#### Option B: Persistent Deployment (for production)
+
+```bash
+pixi run serve-deploy
+```
+
+This deploys a persistent web service that:
+- Stays running even after you close your terminal
+- Gets a permanent URL
+- Automatically scales based on traffic
+- Good for production use
+
+The API will be available at a URL like `https://rsmichael--alphagenome-inference-fastapi-app.modal.run`
+
+## API Usage
+
 ### Available Commands
 
+**Setup:**
 - `pixi run test-download` - Test HuggingFace authentication (CPU only, fast)
 - `pixi run setup-model` - Download and verify AlphaGenome model (H100 GPU, slow)
+
+**Inference API:**
+- `pixi run serve-temp` - Start temporary inference API endpoint (for testing)
+- `pixi run serve-deploy` - Deploy persistent inference API (for production)
+
+**Other:**
 - `pixi run modal-run` - Run the basic Modal hello world app
 - `pixi run modal-deploy` - Deploy the app to Modal (creates a persistent deployment)
 - `pixi run modal-shell` - Open an interactive shell in the Modal environment
+
+## API Reference
+
+### Endpoints
+
+The inference API provides two endpoints:
+
+#### GET /health
+
+Check if the API and model are ready.
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "model_loaded": true,
+  "message": "AlphaGenome model loaded and ready for inference"
+}
+```
+
+#### POST /predict
+
+Run AlphaGenome inference on DNA sequences.
+
+**Request Body:**
+```json
+{
+  "sequences": ["ATCGATCG..."],
+  "organism": "human",
+  "outputs": ["ATAC", "RNA_SEQ"],
+  "tissues": ["UBERON:0001157"]
+}
+```
+
+**Parameters:**
+- `sequences` (required): List of DNA sequences (ATCG characters, max 65,536 bp each)
+- `organism` (optional): "human" or "mouse" (default: "human")
+- `outputs` (optional): List of output types (default: ["ATAC", "RNA_SEQ"])
+- `tissues` (optional): List of ontology terms to filter by tissue type
+
+**Available Output Types:**
+- `ATAC` - ATAC-seq chromatin accessibility (1bp resolution)
+- `CAGE` - CAGE transcription start sites (1bp resolution)
+- `DNASE` - DNase-seq chromatin accessibility (1bp resolution)
+- `RNA_SEQ` - RNA-seq gene expression (1bp resolution)
+- `PROCAP` - PRO-cap nascent transcription (1bp resolution)
+- `CHIP_HISTONE` - Histone ChIP-seq modifications (128bp resolution)
+- `CHIP_TF` - Transcription factor ChIP-seq (128bp resolution)
+- `SPLICE_SITES` - Splice site classification (1bp resolution)
+- `SPLICE_SITE_USAGE` - Splice site usage quantification (1bp resolution)
+- `SPLICE_JUNCTIONS` - Junction predictions between splice sites
+- `CONTACT_MAPS` - 3D chromatin contact maps (2048bp resolution)
+
+**Response:**
+```json
+{
+  "predictions": [
+    {
+      "sequence_index": 0,
+      "sequence_length": 2048,
+      "outputs": {
+        "ATAC": {
+          "values": [[0.1, 0.2], [0.3, 0.4], ...],
+          "shape": [2048, 2],
+          "resolution": 1,
+          "tracks": ["tissue1_+", "tissue1_-"]
+        },
+        "RNA_SEQ": {
+          "values": [[0.5, 0.6], ...],
+          "shape": [2048, 2],
+          "resolution": 1,
+          "tracks": ["tissue1_+", "tissue1_-"]
+        }
+      }
+    }
+  ],
+  "organism": "human"
+}
+```
+
+### Usage Examples
+
+#### cURL
+
+```bash
+# Get API health status
+curl https://your-modal-url.modal.run/health
+
+# Make a prediction
+curl -X POST https://your-modal-url.modal.run/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sequences": ["ATCGATCGATCGATCG"],
+    "organism": "human",
+    "outputs": ["ATAC", "RNA_SEQ"]
+  }'
+```
+
+#### Python
+
+```python
+import requests
+
+# API endpoint URL (get this from Modal after deploying)
+API_URL = "https://your-modal-url.modal.run"
+
+# Check health
+response = requests.get(f"{API_URL}/health")
+print(response.json())
+
+# Make a prediction
+sequence = "ATCG" * 512  # 2048 bp sequence
+
+response = requests.post(
+    f"{API_URL}/predict",
+    json={
+        "sequences": [sequence],
+        "organism": "human",
+        "outputs": ["ATAC", "RNA_SEQ"],
+        "tissues": ["UBERON:0001157"],  # Optional: colon tissue
+    }
+)
+
+result = response.json()
+predictions = result["predictions"][0]
+
+# Access ATAC predictions
+atac_values = predictions["outputs"]["ATAC"]["values"]
+print(f"ATAC shape: {predictions['outputs']['ATAC']['shape']}")
+print(f"First prediction: {atac_values[0]}")
+```
+
+#### Batch Inference
+
+```python
+# Process multiple sequences in one request
+sequences = [
+    "ATCG" * 512,  # Sequence 1: 2048 bp
+    "GCTA" * 256,  # Sequence 2: 1024 bp (will be auto-padded)
+    "TTAA" * 1024, # Sequence 3: 4096 bp
+]
+
+response = requests.post(
+    f"{API_URL}/predict",
+    json={
+        "sequences": sequences,
+        "organism": "human",
+        "outputs": ["ATAC"],
+    }
+)
+
+result = response.json()
+
+# Process each sequence's predictions
+for pred in result["predictions"]:
+    seq_idx = pred["sequence_index"]
+    seq_len = pred["sequence_length"]
+    atac = pred["outputs"]["ATAC"]
+    print(f"Sequence {seq_idx} ({seq_len} bp): {atac['shape']}")
+```
+
+### Tissue Filtering with Ontology Terms
+
+You can filter predictions by specific cell or tissue types using ontology terms:
+
+```python
+# Predict for specific tissue type
+response = requests.post(
+    f"{API_URL}/predict",
+    json={
+        "sequences": [sequence],
+        "outputs": ["RNA_SEQ"],
+        "tissues": [
+            "UBERON:0001157",  # colon
+            "UBERON:0002048",  # lung
+        ],
+    }
+)
+```
+
+Common ontology terms:
+- `UBERON:0001157` - colon
+- `UBERON:0002048` - lung
+- `UBERON:0000948` - heart
+- `UBERON:0002037` - cerebellum
+- `UBERON:0002107` - liver
+
+For more ontology terms, see the [Uberon Ontology](http://uberon.github.io/).
 
 ## Project Structure
 
@@ -184,7 +411,9 @@ modal_alphagenome/
     ├── __init__.py                # Package initialization
     ├── app.py                     # Basic Modal hello world app
     ├── download_test.py           # CPU-only HuggingFace auth test
-    └── model_setup.py             # H100 model download and verification
+    ├── model_setup.py             # H100 model download and verification
+    ├── inference.py               # Inference API with FastAPI endpoints
+    └── alphagenome_research/      # AlphaGenome research code (vendored)
 ```
 
 ## Model Storage
@@ -197,13 +426,15 @@ The AlphaGenome model weights are stored in a Modal Volume named `alphagenome-mo
 
 ## Next Steps
 
-Now that the model is downloaded, future development will include:
+The inference API is now ready for DNA sequence analysis. Future development can include:
 
-- Inference endpoints for DNA sequence analysis
-- Batch inference capabilities
+- Variant effect prediction endpoint
+- Genomic interval-based predictions (requires reference genome)
+- Longer sequence support with windowing (>65K bp)
 - Training pipeline integration
-- API endpoints for external access
+- Result caching and storage
 - Model versioning and updates
+- Async job processing for very long sequences
 
 ## Troubleshooting
 
