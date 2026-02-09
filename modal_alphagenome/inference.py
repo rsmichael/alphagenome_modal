@@ -560,6 +560,9 @@ async def predict(request: PredictionRequest):
                         num_tracks = values_array.shape[1] if len(values_array.shape) > 1 else 1
                         tracks = [f"track_{i}" for i in range(num_tracks)]
 
+                    # Convert all track names to strings (metadata may return integers)
+                    tracks = [str(track) for track in tracks]
+
                     sequence_outputs[output_name] = OutputData(
                         values=values_list,
                         shape=list(values_array.shape),
