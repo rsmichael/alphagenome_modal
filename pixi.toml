@@ -12,6 +12,10 @@ python = "~=3.14.0"
 modal = "*" # TODO: need to be more specific with the version
 jax = {version = "*", extras = ["cuda12"]}
 huggingface-hub = "*"
+fastapi = "*"
+pydantic = "*"
+marimo = "*"
+requests = "*"
 
 [tasks]
 modal-run = "modal run -m modal_alphagenome.app"
@@ -19,3 +23,5 @@ modal-deploy = "modal deploy -m modal_alphagenome.app"
 modal-shell = "modal shell -m modal_alphagenome.app"
 test-download = "modal run -m modal_alphagenome.download_test"
 setup-model = "modal run -m modal_alphagenome.model_setup"
+serve-temp = "modal serve modal_alphagenome.inference"
+serve-deploy = "modal deploy modal_alphagenome.inference"
