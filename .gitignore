@@ -1,0 +1,10 @@
+# Pixi
+.pixi/
+pixi.lock
+
+# Python
+__pycache__/
+*.pyc
+
+# Modal
+.modal/

@@ -1,0 +1,17 @@
+[project]
+name = "modal_alphagenome"
+version = "0.1.0"
+description = "Alphagenome inference microservice and training pipeline using Modal"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+python = "~=3.14.0"
+
+[pypi-dependencies]
+modal = "*"
+
+[tasks]
+modal-run = "modal run modal_alphagenome.app"
+modal-deploy = "modal deploy modal_alphagenome.app"
+modal-shell = "modal shell modal_alphagenome.app"
