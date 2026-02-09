@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "modal_alphagenome"
 version = "0.1.0"
 description = "Alphagenome inference microservice and training pipeline using Modal"
@@ -9,9 +9,13 @@ platforms = ["osx-arm64", "linux-64"]
 python = "~=3.14.0"
 
 [pypi-dependencies]
-modal = "*"
+modal = "*" # TODO: need to be more specific with the version
+jax = {version = "*", extras = ["cuda12"]}
+huggingface-hub = "*"
 
 [tasks]
-modal-run = "modal run modal_alphagenome.app"
-modal-deploy = "modal deploy modal_alphagenome.app"
-modal-shell = "modal shell modal_alphagenome.app"
+modal-run = "modal run -m modal_alphagenome.app"
+modal-deploy = "modal deploy -m modal_alphagenome.app"
+modal-shell = "modal shell -m modal_alphagenome.app"
+test-download = "modal run -m modal_alphagenome.download_test"
+setup-model = "modal run -m modal_alphagenome.model_setup"
