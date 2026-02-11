@@ -143,10 +143,10 @@ class PredictionRequest(BaseModel):
         """Validate DNA sequences."""
         for i, seq in enumerate(v):
             # Check length
-            if len(seq) > 65536:
+            if len(seq) > 1048576:  # 2^20
                 raise ValueError(
                     f"Sequence {i} is too long ({len(seq)} bp). "
-                    "Maximum supported length is 65,536 bp."
+                    "Maximum supported length is 1,048,576 bp (2^20)."
                 )
             if len(seq) == 0:
                 raise ValueError(f"Sequence {i} is empty.")
@@ -502,8 +502,8 @@ async def predict(request: PredictionRequest):
                 import math
 
                 # Determine required length (power of 2, minimum 2048)
-                if original_length <= 2048:
-                    required_length = 2048
+                if original_length <= 2**14:
+                    required_length = 2**14
                 else:
                     # Find next power of 2
                     required_length = 2 ** math.ceil(math.log2(original_length))
@@ -621,8 +621,11 @@ async def predict(request: PredictionRequest):
     gpu="H100",
     volumes={"/models": model_volume.read_only()},
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    keep_warm=1,  # Keep one instance warm for faster responses
-    container_idle_timeout=300,  # Keep containers alive for 5 minutes
+    min_containers=0,  # No containers running until first API call
+    max_containers=1,  # Reuse same container for all requests (TODO: may want to increase for higher throughput)
+    scaledown_window=300,  # Keep containers alive for 5 minutes after use
+    timeout=300,  # 5 minutes for long sequences
+    allow_concurrent_inputs=10,  # Allow up to 10 requests to queue on same container
 )
 @modal.asgi_app()
 def fastapi_app():
