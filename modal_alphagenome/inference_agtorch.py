@@ -189,6 +189,57 @@ class EmbedRequest(BaseModel):
         return v
 
 
+class EmbedBatchRequest(BaseModel):
+    sequences: list[str] = Field(
+        ...,
+        description="List of DNA sequences (ACGTN). Each padded to 131,072 bp if shorter.",
+        min_length=1,
+    )
+    organism: str = Field(default="human", description="'human' or 'mouse' — shared across the batch.")
+    resolution: Optional[int] = Field(
+        default=128,
+        description="1, 128, or null (both). 128 skips the decoder.",
+    )
+    center_pos: Optional[int] = Field(
+        default=None,
+        description="Center position (0-based) for 1bp crop. Defaults to sequence midpoint.",
+    )
+    window_bp: Optional[int] = Field(
+        default=None,
+        description="Number of 1bp positions to return around center_pos. Only applies when resolution=1.",
+    )
+
+    @field_validator("sequences")
+    @classmethod
+    def validate_sequences(cls, v):
+        for i, seq in enumerate(v):
+            invalid = set(seq.upper()) - set("ACGTN")
+            if invalid:
+                raise ValueError(f"sequences[{i}] contains invalid characters: {invalid}")
+        return [seq.upper() for seq in v]
+
+    @field_validator("organism")
+    @classmethod
+    def validate_organism(cls, v):
+        if v.lower() not in ORGANISM_INDEX:
+            raise ValueError(f"organism must be one of {list(ORGANISM_INDEX)}")
+        return v.lower()
+
+    @field_validator("resolution")
+    @classmethod
+    def validate_resolution(cls, v):
+        if v is not None and v not in (1, 128):
+            raise ValueError("resolution must be 1, 128, or null")
+        return v
+
+    @field_validator("window_bp")
+    @classmethod
+    def validate_window_bp(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("window_bp must be a positive integer")
+        return v
+
+
 # ---------------------------------------------------------------------------
 # Modal service class
 # ---------------------------------------------------------------------------
@@ -219,25 +270,47 @@ class AlphaGenomeService:
         )
         self.model.eval()
         print("Compiling model with torch.compile ...")
-        self.model = torch.compile(self.model, mode="reduce-overhead")
+        self.model = torch.compile(self.model, mode="default", dynamic=True)
         print("Model ready.")
 
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------
 
+    def _pad(self, sequence: str) -> str:
+        if len(sequence) < SEQ_LEN:
+            return sequence + "N" * (SEQ_LEN - len(sequence))
+        return sequence[:SEQ_LEN]
+
     def _prepare_input(self, sequence: str, organism: str):
         import torch
         from alphagenome_pytorch.utils.sequence import sequence_to_onehot_tensor
 
-        if len(sequence) < SEQ_LEN:
-            sequence = sequence + "N" * (SEQ_LEN - len(sequence))
-        else:
-            sequence = sequence[:SEQ_LEN]
-
-        dna = sequence_to_onehot_tensor(sequence, device="cuda").unsqueeze(0)
+        dna = sequence_to_onehot_tensor(self._pad(sequence), device="cuda").unsqueeze(0)
         org = torch.tensor([ORGANISM_INDEX[organism]], device="cuda")
         return dna, org
+
+    def _prepare_input_batch(self, sequences: list[str], organism: str):
+        import numpy as np
+        import torch
+        from alphagenome_pytorch.utils.sequence import sequence_to_onehot
+
+        # Stack all sequences into one numpy array, then do a single GPU transfer.
+        # Faster than B individual sequence_to_onehot_tensor calls + torch.stack.
+        onehots = np.stack([sequence_to_onehot(self._pad(s)) for s in sequences])  # (B, SEQ_LEN, 4) uint8
+        dna = torch.from_numpy(onehots.astype(np.float32)).cuda()
+        org = torch.full((len(sequences),), ORGANISM_INDEX[organism], dtype=torch.long, device="cuda")
+        return dna, org
+
+    def _crop_1bp(self, emb: dict, resolution, window_bp, center_pos) -> dict:
+        """Slice embeddings_1bp to the requested window in-place."""
+        if resolution in (1, None) and "embeddings_1bp" in emb and window_bp is not None:
+            seq_len = emb["embeddings_1bp"].shape[1]
+            center = center_pos if center_pos is not None else seq_len // 2
+            start = max(0, center - window_bp // 2)
+            end = min(seq_len, start + window_bp)
+            emb["embeddings_1bp"] = emb["embeddings_1bp"][:, start:end, :]
+        return emb
 
     def _resolutions_tuple(self, resolution: Optional[int]):
         if resolution == 1:
@@ -306,17 +379,34 @@ class AlphaGenomeService:
             with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=use_amp):
                 emb = self.model.encode(dna, org, resolutions=resolutions)
 
-        # Crop 1bp embeddings to the requested window before serializing.
-        # embeddings_1bp shape: (1, SEQ_LEN, 1536) — SEQ_LEN=131072
-        if req.resolution in (1, None) and "embeddings_1bp" in emb and req.window_bp is not None:
-            seq_len = emb["embeddings_1bp"].shape[1]
-            center = req.center_pos if req.center_pos is not None else seq_len // 2
-            half = req.window_bp // 2
-            start = max(0, center - half)
-            end = min(seq_len, start + req.window_bp)
-            emb["embeddings_1bp"] = emb["embeddings_1bp"][:, start:end, :]
-
+        emb = self._crop_1bp(emb, req.resolution, req.window_bp, req.center_pos)
         return {key: _tensor_to_encoded(val) for key, val in emb.items()}
+
+    def _run_embed_batch(self, req: EmbedBatchRequest) -> dict:
+        import torch
+
+        dna, org = self._prepare_input_batch(req.sequences, req.organism)
+        resolutions = self._resolutions_tuple(req.resolution)
+
+        compute_dtype = self.model.dtype_policy.compute_dtype
+        use_amp = compute_dtype != torch.float32
+
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=use_amp):
+                emb = self.model.encode(dna, org, resolutions=resolutions)
+
+        emb = self._crop_1bp(emb, req.resolution, req.window_bp, req.center_pos)
+
+        # Split batch dimension: (B, S, C) → list of (1, S, C) encoded dicts
+        B = len(req.sequences)
+        results = []
+        for i in range(B):
+            results.append({
+                key: _tensor_to_encoded(val[i : i + 1])
+                for key, val in emb.items()
+            })
+
+        return {"results": results}
 
     # -------------------------------------------------------------------------
     # FastAPI routes — defined inside serve() so they close over `self`
@@ -348,11 +438,17 @@ class AlphaGenomeService:
 
         @web_app.post("/embed")
         async def embed(req: EmbedRequest):
-            """Extract trunk embeddings without running prediction heads.
-
-            Useful for fine-tuning: run this once per sequence, then train
-            a lightweight head on the returned embeddings.
-            """
+            """Extract trunk embeddings for a single sequence."""
             return self._run_embed(req)
+
+        @web_app.post("/embed-batch")
+        async def embed_batch(req: EmbedBatchRequest):
+            """Extract trunk embeddings for a batch of sequences in one GPU call.
+
+            Stacks all sequences into a single (B, 131072, 4) tensor, runs
+            encode() once, then splits results back per sequence.
+            Returns {"results": [<embed_dict>, ...]}, one entry per input sequence.
+            """
+            return self._run_embed_batch(req)
 
         return web_app
