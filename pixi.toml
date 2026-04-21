@@ -23,6 +23,7 @@ pybigwig = "*"
 pandas = "*"
 tqdm = "*"
 pyfaidx = "*"
+zstandard = ">=0.25.0, <0.26"
 
 [tasks]
 modal-run = "modal run -m modal_alphagenome.app"
