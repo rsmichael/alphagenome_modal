@@ -7,6 +7,8 @@ platforms = ["osx-arm64", "linux-64"]
 
 [dependencies]
 python = "~=3.14.0"
+pytorch = "*"
+
 
 [pypi-dependencies]
 modal = "*" # TODO: need to be more specific with the version
@@ -16,6 +18,11 @@ fastapi = "*"
 pydantic = "*"
 marimo = "*"
 requests = "*"
+alphagenome-pytorch = { path = "./alphagenome-pytorch", editable = true }
+pybigwig = "*"
+pandas = "*"
+tqdm = "*"
+pyfaidx = "*"
 
 [tasks]
 modal-run = "modal run -m modal_alphagenome.app"
@@ -23,5 +30,8 @@ modal-deploy = "modal deploy -m modal_alphagenome.app"
 modal-shell = "modal shell -m modal_alphagenome.app"
 test-download = "modal run -m modal_alphagenome.download_test"
 setup-model = "modal run -m modal_alphagenome.model_setup"
+convert-weights = "modal run -m modal_alphagenome.model_setup::convert_to_pytorch"
 serve-temp = "modal serve -m modal_alphagenome.inference"
 serve-deploy = "modal deploy -m modal_alphagenome.inference"
+serve-torch-temp = "modal serve -m modal_alphagenome.inference_agtorch"
+serve-torch-deploy = "modal deploy -m modal_alphagenome.inference_agtorch"

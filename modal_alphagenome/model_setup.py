@@ -4,31 +4,54 @@ import modal
 
 app = modal.App("alphagenome-model-setup")
 
-# Build image with CUDA, JAX, and AlphaGenome dependencies
+_APT_PACKAGES = ["git", "build-essential", "clang", "pkg-config"]
+
+# Image for JAX-based download/verify (Python 3.11, existing behaviour)
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.2.0-devel-ubuntu22.04",
-        add_python="3.11"  # AlphaGenome may not support 3.14 yet
+        add_python="3.11",
     )
-    .apt_install(
-        "git",
-        "build-essential",  # C/C++ compilers (gcc, g++)
-        "clang",            # Clang compiler (needed by sorted_nearest)
-        "pkg-config",       # Package configuration
-    )
+    .apt_install(*_APT_PACKAGES)
     .pip_install(
         "jax[cuda12]",
         "huggingface-hub",
         find_links="https://storage.googleapis.com/jax-releases/jax_cuda_releases.html",
     )
-    # Copy and install alphagenome_research from local directory
     .add_local_dir(
         local_path="modal_alphagenome/alphagenome_research",
         remote_path="/root/alphagenome_research",
-        copy=True,  # Copy into image to allow further build steps
+        copy=True,
     )
+    .run_commands("pip install /root/alphagenome_research")
+)
+
+# Image for PyTorch weight conversion.
+# Requires Python 3.12 (alphagenome-pytorch minimum), JAX for orbax checkpoint
+# loading, and torch for building the PyTorch state dict.
+convert_image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:12.2.0-devel-ubuntu22.04",
+        add_python="3.12",
+    )
+    .apt_install(*_APT_PACKAGES)
+    .pip_install(
+        "jax[cuda12]",
+        "huggingface-hub",
+        "torch",
+        "orbax-checkpoint",
+        "safetensors",
+        find_links="https://storage.googleapis.com/jax-releases/jax_cuda_releases.html",
+    )
+    .add_local_dir(
+        local_path="modal_alphagenome/alphagenome_research",
+        remote_path="/root/alphagenome_research",
+        copy=True,
+    )
+    .run_commands("pip install /root/alphagenome_research")
     .run_commands(
-        "pip install /root/alphagenome_research"
+        "git clone https://github.com/genomicsxai/alphagenome-pytorch /root/alphagenome-pytorch",
+        "pip install /root/alphagenome-pytorch",
     )
 )
 
@@ -298,37 +321,135 @@ def verify_model():
         }
 
 
+@app.function(
+    image=convert_image,
+    volumes={"/models": model_volume},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    gpu="any",   # GPU needed for JAX initialisation; no heavy compute required
+    timeout=1800,
+)
+def convert_to_pytorch(output_filename: str = "model_pytorch.pth"):
+    """Convert the JAX orbax checkpoint to a PyTorch .pth file.
+
+    Reads the JAX checkpoint already present on the volume (written by
+    download_model), runs convert_weights.py, and saves the result back to
+    the same volume at /models/<output_filename>.
+
+    Args:
+        output_filename: Name of the output file under /models/.
+                         Use a .safetensors suffix to save in safetensors format.
+    """
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from huggingface_hub import login, snapshot_download
+
+    cache_dir = Path("/models/huggingface_cache")
+    output_path = Path("/models") / output_filename
+
+    os.environ["HF_HOME"] = str(cache_dir)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_dir)
+
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        login(token=token)
+
+    if not cache_dir.exists():
+        return {
+            "success": False,
+            "error": "JAX checkpoint not found. Run download_model first.",
+        }
+
+    # Locate the snapshot directory without triggering a download
+    checkpoint_path = snapshot_download(
+        repo_id="google/alphagenome-all-folds",
+        cache_dir=str(cache_dir),
+        token=token,
+        local_files_only=True,
+    )
+    print(f"JAX checkpoint: {checkpoint_path}")
+    print(f"Output:         {output_path}")
+
+    if output_path.exists():
+        size_mb = output_path.stat().st_size / 1024 / 1024
+        print(f"Output already exists ({size_mb:.0f} MB) — overwriting.")
+
+    # Build the subprocess command
+    script = "/root/alphagenome-pytorch/scripts/convert_weights.py"
+    cmd = [
+        sys.executable, script,
+        checkpoint_path,
+        "--output", str(output_path),
+    ]
+    if output_filename.endswith(".safetensors"):
+        cmd.append("--safetensors")
+
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=False)  # stream output to Modal logs
+
+    if result.returncode != 0:
+        return {
+            "success": False,
+            "error": f"convert_weights.py exited with code {result.returncode}",
+        }
+
+    size_mb = output_path.stat().st_size / 1024 / 1024
+    print(f"Conversion complete. Saved {size_mb:.0f} MB to {output_path}")
+
+    model_volume.commit()
+    print("Volume committed.")
+
+    return {
+        "success": True,
+        "output_path": str(output_path),
+        "size_mb": round(size_mb, 1),
+    }
+
+
 @app.local_entrypoint()
 def main():
-    """Download and verify AlphaGenome model."""
+    """Download JAX weights, verify them, and convert to PyTorch format."""
     print("=" * 70)
     print("AlphaGenome Model Setup (H100 GPU)")
     print("=" * 70)
 
-    # Step 1: Download model
-    print("\n[1/2] Downloading model to Modal volume...")
+    # Step 1: Download JAX checkpoint
+    print("\n[1/3] Downloading JAX checkpoint to Modal volume...")
     print("-" * 70)
     download_result = download_model.remote()
     print(f"\nResult: {download_result}")
 
-    # Step 2: Verify model
+    # Step 2: Verify JAX model loads
     print("\n" + "=" * 70)
-    print("[2/2] Verifying model loads correctly...")
+    print("[2/3] Verifying JAX model loads correctly...")
     print("-" * 70)
     verify_result = verify_model.remote()
 
+    if verify_result.get("success"):
+        print("✓ JAX model verified.")
+    else:
+        print("✗ JAX verification FAILED — aborting before conversion.")
+        print(f"Error: {verify_result.get('error')}")
+        return
+
+    # Step 3: Convert to PyTorch
     print("\n" + "=" * 70)
-    print("VERIFICATION RESULTS:")
+    print("[3/3] Converting JAX checkpoint to PyTorch weights...")
+    print("-" * 70)
+    convert_result = convert_to_pytorch.remote()
+
+    print("\n" + "=" * 70)
+    print("FINAL RESULTS:")
     print("=" * 70)
 
-    if verify_result.get("success"):
+    if convert_result.get("success"):
         print("✓ SUCCESS!")
-        print(f"\n{verify_result['message']}")
-        print(f"\nModel info:")
-        for key, value in verify_result.get("info", {}).items():
-            print(f"  {key}: {value}")
+        print(f"  PyTorch weights: {convert_result['output_path']}")
+        print(f"  File size:       {convert_result['size_mb']} MB")
     else:
-        print("✗ VERIFICATION FAILED!")
-        print(f"\nError: {verify_result.get('error')}")
+        print("✗ CONVERSION FAILED!")
+        print(f"  Error: {convert_result.get('error')}")
 
     print("=" * 70)
