@@ -19,6 +19,7 @@ image = (
         "fastapi",
         "pydantic",
         "safetensors",
+        "zstandard",
     )
     .apt_install("git")
     .run_commands(
@@ -52,21 +53,27 @@ SPLICE_HEADS = {"splice_sites_classification", "splice_sites_usage", "splice_sit
 
 
 def _encode(arr) -> dict:
-    """Encode a numpy array as base64 with shape/dtype metadata."""
+    """Encode a numpy array as zstd-compressed base64 with shape/dtype metadata."""
+    import zstandard as zstd
     import numpy as np
     arr = np.asarray(arr)
+    compressed = zstd.ZstdCompressor(level=1).compress(arr.tobytes())
     return {
-        "data": base64.b64encode(arr.tobytes()).decode("ascii"),
+        "data": base64.b64encode(compressed).decode("ascii"),
         "shape": list(arr.shape),
         "dtype": str(arr.dtype),
+        "encoding": "zstd",
     }
 
 
-def _tensor_to_encoded(t) -> dict:
+def _tensor_to_encoded(t, fp16: bool = True) -> dict:
     import torch
     arr = t.detach().cpu()
+    # bfloat16 has no numpy equivalent; cast to float16 (half the payload vs float32)
     if arr.dtype == torch.bfloat16:
-        arr = arr.float()
+        arr = arr.to(torch.float16)
+    elif arr.dtype == torch.float32 and fp16:
+        arr = arr.to(torch.float16)
     return _encode(arr.numpy())
 
 

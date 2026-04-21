@@ -65,9 +65,11 @@ def _(BASE_URL, requests):
 @app.cell
 def _(base64, np, predict_data):
     def decode(item):
-        return np.frombuffer(
-            base64.b64decode(item["data"]), dtype=item["dtype"]
-        ).reshape(item["shape"])
+        raw = base64.b64decode(item["data"])
+        if item.get("encoding") == "zstd":
+            import zstandard as zstd
+            raw = zstd.ZstdDecompressor().decompress(raw)
+        return np.frombuffer(raw, dtype=item["dtype"]).reshape(item["shape"])
 
     atac_128 = decode(predict_data["heads"]["atac"]["128"])
     print(f"atac[128] shape: {atac_128.shape}")   # expect (1, 1024, 256)
@@ -149,7 +151,7 @@ def _(BASE_URL, decode, requests):
     import time
     def batch_run(BATCH_SIZE = 4):
         WINDOW = 10_000
-        SEQS = ["ATCG" * 512, "GCTA" * 512, "TTAA" * 512, "CCGG" * 512] *4
+        SEQS = ["ATCG" * 512, "GCTA" * 512, "TTAA" * 512, "CCGG" * 512] *8
         SEQS = SEQS[:BATCH_SIZE]
 
         # --- batched ---
@@ -207,7 +209,7 @@ def _(batch_run):
 
 @app.cell
 def _(batch_run):
-    batch_run(12)
+    batch_run(16)
     return
 
 
