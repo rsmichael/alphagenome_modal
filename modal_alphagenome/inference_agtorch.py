@@ -278,6 +278,14 @@ class AlphaGenomeService:
         self.model.eval()
         print("Compiling model with torch.compile ...")
         self.model = torch.compile(self.model, mode="default", dynamic=True)
+        # Build ASCII→one-hot lookup table on GPU.
+        # Shape (128, 4): row i = one-hot for ASCII byte i; all-zeros for N/unknown.
+        import torch
+        lookup = torch.zeros(128, 4, dtype=torch.float32, device="cuda")
+        for idx, ch in enumerate("ACGT"):
+            lookup[ord(ch)] = torch.eye(4)[idx]
+            lookup[ord(ch.lower())] = torch.eye(4)[idx]
+        self._onehot_lookup = lookup  # (128, 4) on GPU
         print("Model ready.")
 
     # -------------------------------------------------------------------------
@@ -289,23 +297,34 @@ class AlphaGenomeService:
             return sequence + "N" * (SEQ_LEN - len(sequence))
         return sequence[:SEQ_LEN]
 
+    def _seq_to_gpu(self, sequences: list[str]):
+        """Convert padded DNA strings to a GPU float32 one-hot tensor.
+
+        Transfers raw ASCII bytes (1 byte/base) to GPU instead of float32
+        one-hots (16 bytes/base), then applies a lookup table — 16x smaller
+        host→device transfer.
+        """
+        import numpy as np
+        import torch
+
+        # Pack all sequences into a single uint8 array — CPU only does ascii encode
+        padded = [self._pad(s) for s in sequences]
+        raw = np.frombuffer("".join(padded).encode("ascii"), dtype=np.uint8).reshape(len(padded), SEQ_LEN)
+        byte_tensor = torch.from_numpy(raw).to("cuda", non_blocking=True)  # (B, L) uint8
+        dna = self._onehot_lookup[byte_tensor.long()]  # (B, L, 4) float32 via GPU lookup
+        return dna
+
     def _prepare_input(self, sequence: str, organism: str):
         import torch
-        from alphagenome_pytorch.utils.sequence import sequence_to_onehot_tensor
 
-        dna = sequence_to_onehot_tensor(self._pad(sequence), device="cuda").unsqueeze(0)
+        dna = self._seq_to_gpu([sequence])  # (1, L, 4)
         org = torch.tensor([ORGANISM_INDEX[organism]], device="cuda")
         return dna, org
 
     def _prepare_input_batch(self, sequences: list[str], organism: str):
-        import numpy as np
         import torch
-        from alphagenome_pytorch.utils.sequence import sequence_to_onehot
 
-        # Stack all sequences into one numpy array, then do a single GPU transfer.
-        # Faster than B individual sequence_to_onehot_tensor calls + torch.stack.
-        onehots = np.stack([sequence_to_onehot(self._pad(s)) for s in sequences])  # (B, SEQ_LEN, 4) uint8
-        dna = torch.from_numpy(onehots.astype(np.float32)).cuda()
+        dna = self._seq_to_gpu(sequences)  # (B, L, 4)
         org = torch.full((len(sequences),), ORGANISM_INDEX[organism], dtype=torch.long, device="cuda")
         return dna, org
 
@@ -404,14 +423,16 @@ class AlphaGenomeService:
 
         emb = self._crop_1bp(emb, req.resolution, req.window_bp, req.center_pos)
 
-        # Split batch dimension: (B, S, C) → list of (1, S, C) encoded dicts
+        # Move all tensors to CPU once, then encode in parallel across sequences.
         B = len(req.sequences)
-        results = []
-        for i in range(B):
-            results.append({
-                key: _tensor_to_encoded(val[i : i + 1])
-                for key, val in emb.items()
-            })
+        cpu_emb = {key: val.detach().cpu() for key, val in emb.items()}
+
+        def _encode_seq(i):
+            return {key: _tensor_to_encoded(t[i : i + 1]) for key, t in cpu_emb.items()}
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=B) as pool:
+            results = list(pool.map(_encode_seq, range(B)))
 
         return {"results": results}
 
