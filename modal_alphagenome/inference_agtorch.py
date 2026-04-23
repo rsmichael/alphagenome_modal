@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field, field_validator
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "xz-utils", "liblzma-dev")
-    .pip_install(
+    .pip_install("uv")
+    .uv_pip_install(
         "torch",
         "numpy",
         "fastapi",
@@ -22,6 +23,10 @@ image = (
         "safetensors",
         "zstandard",
         "dna-parser",
+        "lance",
+        "lancedb",
+        "pyarrow",
+        "duckdb",
     )
     .run_commands(
         "git clone https://github.com/genomicsxai/alphagenome-pytorch /root/alphagenome-pytorch",
@@ -260,6 +265,65 @@ class EmbedBatchRequest(BaseModel):
         if v is not None and v < 1:
             raise ValueError("window_bp must be a positive integer")
         return v
+
+
+# ---------------------------------------------------------------------------
+# Stateless sequence-encoding helpers (importable by other Modal modules)
+# ---------------------------------------------------------------------------
+
+
+def _pad(sequence: str) -> str:
+    """Pad with N or truncate to SEQ_LEN."""
+    if len(sequence) < SEQ_LEN:
+        return sequence + "N" * (SEQ_LEN - len(sequence))
+    return sequence[:SEQ_LEN]
+
+
+def _seq_to_gpu(sequences: list[str], onehot_lookup):
+    """ASCII lookup path: transfers 1 byte/base to GPU, applies lookup table there."""
+    import numpy as np
+    import torch
+
+    padded = [_pad(s) for s in sequences]
+    raw = np.frombuffer("".join(padded).encode("ascii"), dtype=np.uint8).reshape(len(padded), SEQ_LEN).copy()
+    byte_tensor = torch.from_numpy(raw).to("cuda", non_blocking=True)
+    return onehot_lookup[byte_tensor.long()]  # (B, L, 4) float32
+
+
+def _seq_to_gpu_dna_parser(sequences: list[str]):
+    """dna_parser path: multi-threaded Rust encoding on CPU, int8 transferred to GPU."""
+    import numpy as np
+    import torch
+    import dna_parser
+
+    B = len(sequences)
+    arrs = dna_parser.onehot_encoding_rust(sequences, "after", SEQ_LEN, 0)
+    stacked = np.stack(arrs)  # (B, SEQ_LEN, 4) int8, columns C,G,A,T
+    mat = np.empty((B, SEQ_LEN, 4), dtype=np.int8)
+    mat[:, :, 0] = stacked[:, :, 2]  # A was col 2
+    mat[:, :, 1] = stacked[:, :, 0]  # C was col 0
+    mat[:, :, 2] = stacked[:, :, 1]  # G was col 1
+    mat[:, :, 3] = stacked[:, :, 3]  # T was col 3
+    return torch.from_numpy(mat).to("cuda", non_blocking=True).float()
+
+
+def _crop_1bp(emb: dict, resolution, window_bp, center_pos) -> dict:
+    """Slice embeddings_1bp to the requested window."""
+    if resolution in (1, None) and "embeddings_1bp" in emb and window_bp is not None:
+        seq_len = emb["embeddings_1bp"].shape[1]
+        center = center_pos if center_pos is not None else seq_len // 2
+        start = max(0, center - window_bp // 2)
+        end = min(seq_len, start + window_bp)
+        emb["embeddings_1bp"] = emb["embeddings_1bp"][:, start:end, :]
+    return emb
+
+
+def _resolutions_tuple(resolution: Optional[int]):
+    if resolution == 1:
+        return (1,)
+    if resolution == 128:
+        return (128,)
+    return None
 
 
 # ---------------------------------------------------------------------------

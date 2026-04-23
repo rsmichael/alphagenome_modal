@@ -19,7 +19,7 @@ def _():
 @app.cell
 def _(mo):
     url_input = mo.ui.text(
-        value="https://rsmichael--alphagenome-inference-torch-alphagenomese-2f9b47-dev.modal.run",
+        value="https://rsmichael--alphagenome-inference-torch-alphagenomeservice-serve.modal.run",
         label="Modal service URL (from `pixi run serve-torch-temp`)",
         full_width=True,
     )
@@ -452,7 +452,7 @@ def _(BASE_URL, decode, np, requests):
 
         return df.with_columns([v for v in new_cols.values()])
 
-    return embed_dataframe, pl
+    return embed_dataframe, math, pl
 
 
 @app.cell
@@ -509,25 +509,25 @@ def _():
 
 
 @app.cell
-def _(embed_dataframe, pl):
-    demo_df = pl.DataFrame({
-        "name":     ["seq_A", "seq_B", "seq_C", "seq_D", "seq_E", "seq_F"]*100,
-        "sequence": ["ATCG" * 512, "GCTA" * 512, "TTAA" * 512,
-                     "CCGG" * 512, "AATT" * 512, "GGCC" * 512]*100,
-    })
+def _():
+    # demo_df = pl.DataFrame({
+    #     "name":     ["seq_A", "seq_B", "seq_C", "seq_D", "seq_E", "seq_F"]*10,
+    #     "sequence": ["ATCG" * 512, "GCTA" * 512, "TTAA" * 512,
+    #                  "CCGG" * 512, "AATT" * 512, "GGCC" * 512]*10,
+    # })
 
-    result_df = embed_dataframe(
-        demo_df,
-        seq_col="sequence",
-        batch_size=3,
-        resolution=1,
-        window_bp=10_000,
-        max_workers=10,
-        lance_out="demo_embeddings3.lance",
-    )
+    # result_df = embed_dataframe(
+    #     demo_df,
+    #     seq_col="sequence",
+    #     batch_size=3,
+    #     resolution=1,
+    #     window_bp=10_000,
+    #     max_workers=10,
+    #     lance_out="demo_embeddings3.lance",
+    # )
 
     # print(result_df.select(["name", "emb_1bp_mean"]))
-    return (result_df,)
+    return
 
 
 @app.cell
@@ -604,6 +604,159 @@ def _():
     #     .to_arrow()
     # )
     # pl.from_arrow(hits).select(["name", "row_idx", "_distance"])
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## embed_to_volume — Modal SDK path (no HTTP embedding transfer)
+
+    Instead of serializing embeddings over HTTP, `EmbedToLance.embed_batch` writes
+    directly to a Lance dataset on a Modal volume. Only sequences + metadata travel
+    to Modal (via pickle); only row-index metadata comes back. The heavy embedding
+    arrays never cross the network.
+
+    Compare with `embed_dataframe(lance_out=...)` which goes:
+    GPU → zstd+base64 → HTTP → decode → write local Lance.
+
+    | | HTTP path | Volume path |
+    |---|---|---|
+    | Data sent to Modal | sequences (JSON) | sequences + metadata (pickle) |
+    | Data returned | embeddings (zstd+b64) | row indices only |
+    | Lance written by | client | Modal container |
+    | Lance location | local | Modal volume |
+    """)
+    return
+
+
+@app.cell
+def _():
+    import modal as _modal
+    EmbedToLance = _modal.Cls.from_name("alphagenome-inference-torch", "EmbedToLance")
+    return (EmbedToLance,)
+
+
+@app.cell
+def _(EmbedToLance):
+    EmbedToLance
+    return
+
+
+@app.cell
+def _(EmbedToLance, math):
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
+
+    def embed_to_volume(
+        df,
+        seq_col: str,
+        dataset_name: str,
+        *,
+        batch_size: int = 4,
+        max_workers: int = 8,
+        resolution: int = 1,
+        window_bp: int = 10_000,
+        organism: str = "human",
+        use_dna_parser: bool = False,
+    ):
+        """Embed sequences and write to a Lance dataset on the Modal volume.
+
+        Args:
+            df:           Input Polars DataFrame.
+            seq_col:      Column containing DNA sequences.
+            dataset_name: Lance dataset name on the volume (no .lance extension).
+
+        Returns:
+            List of metadata dicts returned by each batch call.
+        """
+        sequences = df[seq_col].to_list()
+        metadata  = df.drop(seq_col).to_dicts()
+        n = len(sequences)
+        n_batches = math.ceil(n / batch_size)
+        batches = [
+            (b, sequences[b*batch_size:(b+1)*batch_size], metadata[b*batch_size:(b+1)*batch_size])
+            for b in range(n_batches)
+        ]
+
+        def _call(item):
+            b, seqs, meta = item
+            return EmbedToLance().embed_batch.remote(
+                seqs, dataset_name, meta,
+                start_row=b * batch_size,
+                resolution=resolution,
+                window_bp=window_bp,
+                organism=organism,
+                use_dna_parser=use_dna_parser,
+            )
+
+        results = []
+        with _TPE(max_workers=max_workers) as pool:
+            futures = {pool.submit(_call, item): item[0] for item in batches}
+            for fut in _as_completed(futures):
+                meta = fut.result()
+                results.append(meta)
+                print(f"  batch done: {meta}")
+        EmbedToLance().commit_volume.remote()
+        return results
+
+    return (embed_to_volume,)
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
+def _(embed_dataframe, embed_to_volume, pl):
+    import time as _time
+
+    _demo_df = pl.DataFrame({
+        "name":     ["seq_A", "seq_B", "seq_C", "seq_D", "seq_E", "seq_F"] * 40,
+        "sequence": ["ATCG" * 512, "GCTA" * 512, "TTAA" * 512,
+                     "CCGG" * 512, "AATT" * 512, "GGCC" * 512] * 40,
+    })
+
+    _t0 = _time.time()
+    embed_dataframe(_demo_df, "sequence", lance_out=f"demo_timing_http_{str(_t0)}.lance",
+                    batch_size=3, resolution=1, window_bp=1, max_workers=10)
+    _t_http = _time.time() - _t0
+    print(_t_http)
+
+    _t0 = _time.time()
+    embed_dataframe(_demo_df, "sequence", lance_out=f"demo_timing_http_{str(_t0)}.lance",
+                    batch_size=3, resolution=1, window_bp=10_000, max_workers=10)
+    _t_http_10k = _time.time() - _t0
+    print(_t_http_10k)
+
+    _t0 = _time.time()
+    embed_to_volume(_demo_df, "sequence", f"demo_timing_volume_{str(_t0)}",
+                    batch_size=3, resolution=1, window_bp=1, max_workers=10)
+    _t_vol = _time.time() - _t0
+
+
+    _t0 = _time.time()
+    embed_to_volume(_demo_df, "sequence", f"demo_timing_volume_{str(_t0)}",
+                    batch_size=3, resolution=1, window_bp=10_000, max_workers=10)
+    _t_vol_10k = _time.time() - _t0
+
+    print(f"\nHTTP + local Lance:  {_t_http:.1f}s, 10k context output: {_t_http_10k:.1f}s")
+    print(f"Modal volume Lance: {_t_vol:.1f}s, 10k context output: {_t_vol_10k:.1f}s")
+    return
+
+
+@app.cell
+def _(EmbedToLance):
+    import pyarrow as _pa
+    import polars as _pl
+
+    _raw = EmbedToLance.query.remote(
+        "demo_timing_volume",
+        filter_expr="name = 'seq_A'",
+        columns=["row_idx", "name", "embeddings_128bp"],
+    )
+    _tbl = _pa.ipc.open_stream(_raw).read_all()
+    _pl.from_arrow(_tbl)
     return
 
 
