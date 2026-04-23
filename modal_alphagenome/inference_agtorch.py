@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, field_validator
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git", "xz-utils", "liblzma-dev")
     .pip_install(
         "torch",
         "numpy",
@@ -20,8 +21,8 @@ image = (
         "pydantic",
         "safetensors",
         "zstandard",
+        "dna-parser",
     )
-    .apt_install("git")
     .run_commands(
         "git clone https://github.com/genomicsxai/alphagenome-pytorch /root/alphagenome-pytorch",
         "pip install /root/alphagenome-pytorch",
@@ -165,6 +166,13 @@ class EmbedRequest(BaseModel):
             "are returned (large — expect ~768 MB)."
         ),
     )
+    use_dna_parser: bool = Field(
+        default=False,
+        description=(
+            "If true, use dna_parser.onehot_encoding_rust for one-hot encoding "
+            "on CPU instead of the GPU ASCII lookup table."
+        ),
+    )
 
     @field_validator("sequence")
     @classmethod
@@ -215,6 +223,13 @@ class EmbedBatchRequest(BaseModel):
         default=None,
         description="Number of 1bp positions to return around center_pos. Only applies when resolution=1.",
     )
+    use_dna_parser: bool = Field(
+        default=False,
+        description=(
+            "If true, use dna_parser.onehot_encoding_rust for one-hot encoding "
+            "on CPU instead of the GPU ASCII lookup table."
+        ),
+    )
 
     @field_validator("sequences")
     @classmethod
@@ -257,6 +272,7 @@ class EmbedBatchRequest(BaseModel):
     gpu="A10G",
     volumes={"/models": model_volume.read_only()},
     scaledown_window=300,
+    max_containers=10,
     timeout=600,
 )
 @modal.concurrent(max_inputs=4)
@@ -298,7 +314,7 @@ class AlphaGenomeService:
         return sequence[:SEQ_LEN]
 
     def _seq_to_gpu(self, sequences: list[str]):
-        """Convert padded DNA strings to a GPU float32 one-hot tensor.
+        """Convert DNA strings to a GPU float32 one-hot tensor via ASCII lookup.
 
         Transfers raw ASCII bytes (1 byte/base) to GPU instead of float32
         one-hots (16 bytes/base), then applies a lookup table — 16x smaller
@@ -307,24 +323,42 @@ class AlphaGenomeService:
         import numpy as np
         import torch
 
-        # Pack all sequences into a single uint8 array — CPU only does ascii encode
         padded = [self._pad(s) for s in sequences]
-        raw = np.frombuffer("".join(padded).encode("ascii"), dtype=np.uint8).reshape(len(padded), SEQ_LEN)
+        raw = np.frombuffer("".join(padded).encode("ascii"), dtype=np.uint8).reshape(len(padded), SEQ_LEN).copy()
         byte_tensor = torch.from_numpy(raw).to("cuda", non_blocking=True)  # (B, L) uint8
-        dna = self._onehot_lookup[byte_tensor.long()]  # (B, L, 4) float32 via GPU lookup
-        return dna
+        return self._onehot_lookup[byte_tensor.long()]  # (B, L, 4) float32
 
-    def _prepare_input(self, sequence: str, organism: str):
+    def _seq_to_gpu_dna_parser(self, sequences: list[str]):
+        """Convert DNA strings to a GPU float32 one-hot tensor via dna_parser.
+
+        Uses dna_parser.onehot_encoding_rust (multi-threaded Rust) for CPU
+        encoding, then transfers to GPU.
+
+        dna_parser returns columns in C,G,A,T order; we reindex to A,C,G,T
+        to match the model's convention.
+        """
+        import numpy as np
+        import torch
+        import dna_parser
+
+        # Returns list of (SEQ_LEN, 4) int8 arrays, columns in C,G,A,T order
+        arrs = dna_parser.onehot_encoding_rust(sequences, "after", SEQ_LEN, 0)
+        mat = np.stack(arrs)[:, :, [2, 0, 1, 3]]  # (B, SEQ_LEN, 4) reordered to A,C,G,T
+        return torch.from_numpy(mat.astype(np.float32)).to("cuda", non_blocking=True)
+
+    def _prepare_input(self, sequence: str, organism: str, use_dna_parser: bool = False):
         import torch
 
-        dna = self._seq_to_gpu([sequence])  # (1, L, 4)
+        encode = self._seq_to_gpu_dna_parser if use_dna_parser else self._seq_to_gpu
+        dna = encode([sequence])  # (1, L, 4)
         org = torch.tensor([ORGANISM_INDEX[organism]], device="cuda")
         return dna, org
 
-    def _prepare_input_batch(self, sequences: list[str], organism: str):
+    def _prepare_input_batch(self, sequences: list[str], organism: str, use_dna_parser: bool = False):
         import torch
 
-        dna = self._seq_to_gpu(sequences)  # (B, L, 4)
+        encode = self._seq_to_gpu_dna_parser if use_dna_parser else self._seq_to_gpu
+        dna = encode(sequences)  # (B, L, 4)
         org = torch.full((len(sequences),), ORGANISM_INDEX[organism], dtype=torch.long, device="cuda")
         return dna, org
 
@@ -395,7 +429,7 @@ class AlphaGenomeService:
     def _run_embed(self, req: EmbedRequest) -> dict:
         import torch
 
-        dna, org = self._prepare_input(req.sequence, req.organism)
+        dna, org = self._prepare_input(req.sequence, req.organism, req.use_dna_parser)
         resolutions = self._resolutions_tuple(req.resolution)
 
         compute_dtype = self.model.dtype_policy.compute_dtype
@@ -411,7 +445,7 @@ class AlphaGenomeService:
     def _run_embed_batch(self, req: EmbedBatchRequest) -> dict:
         import torch
 
-        dna, org = self._prepare_input_batch(req.sequences, req.organism)
+        dna, org = self._prepare_input_batch(req.sequences, req.organism, req.use_dna_parser)
         resolutions = self._resolutions_tuple(req.resolution)
 
         compute_dtype = self.model.dtype_policy.compute_dtype

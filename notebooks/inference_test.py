@@ -2,7 +2,7 @@
 
 import marimo
 
-__generated_with = "0.19.9"
+__generated_with = "0.21.1"
 app = marimo.App(width="medium")
 
 
@@ -31,7 +31,7 @@ def _(mo):
 def _(mo):
     # API URL input - user should paste their Modal URL here
     api_url_input = mo.ui.text(
-        value="https://rsmichael--alphagenome-inference-fastapi-app.modal.run",
+        value="https://rsmichael--alphagenome-inference-torch-alphagenomese-2f9b47-dev.modal.run",
         label="API URL",
         full_width=True,
     )
@@ -104,7 +104,7 @@ def _():
 def _(mo):
     # Input controls for prediction
     sequence_input = mo.ui.text_area(
-        value="AT" ,#* 2**14,  # 2048 bp
+        value="AT" * 2**14,  # 2048 bp
         label="DNA Sequence",
         full_width=True,
     )
@@ -190,7 +190,7 @@ def _(
 @app.cell
 def _(prediction_result):
     import numpy as np
-    np.array(prediction_result['predictions'][0]['outputs']['ATAC']['values'][0])
+    np.array(prediction_result['predictions'][0]['outputs']['RNA_SEQ']['values'][0])
     return
 
 
