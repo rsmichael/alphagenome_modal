@@ -2,7 +2,7 @@
 
 import marimo
 
-__generated_with = "0.21.1"
+__generated_with = "0.23.2"
 app = marimo.App(width="medium")
 
 
@@ -53,6 +53,7 @@ def _(BASE_URL, requests):
             "organism": "human",
             "heads": ["atac"],
             "resolution": 128,
+            "use_dna_parser": False
         },
         timeout=300,
     )
@@ -192,7 +193,7 @@ def _(BASE_URL, decode, requests):
             print(f"  result[0] {key}: {arr.shape}  dtype={arr.dtype}")
 
     batch_run(4)
-    return batch_run, time
+    return (batch_run,)
 
 
 @app.cell
@@ -214,27 +215,395 @@ def _():
 
 
 @app.cell
-def _(BASE_URL, requests, time):
-    BATCH_SIZE = 12
-    WINDOW = 10_000
-    SEQS = ["ATCG" * 512, "GCTA" * 512, "TTAA" * 512, "CCGG" * 512] *4
-    SEQS = SEQS[:BATCH_SIZE]
+def _():
+    # BATCH_SIZE = 12
+    # WINDOW = 10_000
+    # SEQS = ["ATCG" * 512, "GCTA" * 512, "TTAA" * 512, "CCGG" * 512] *4
+    # SEQS = SEQS[:BATCH_SIZE]
 
-    # --- batched ---
-    t0 = time.time()
-    r_batch = requests.post(
-        f"{BASE_URL}/embed-batch",
-        json={
-            "sequences": SEQS,
-            "organism": "human",
-            "resolution": 1,
-            "window_bp": WINDOW,
-        },
-        timeout=600,
+    # # --- batched ---
+    # t0 = time.time()
+    # r_batch = requests.post(
+    #     f"{BASE_URL}/embed-batch",
+    #     json={
+    #         "sequences": SEQS,
+    #         "organism": "human",
+    #         "resolution": 1,
+    #         "window_bp": WINDOW,
+    #     },
+    #     timeout=600,
+    # )
+    # r_batch.raise_for_status()
+    # t_batch = time.time() - t0
+    # batch_results = r_batch.json()["results"]
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## embed_dataframe — batch-embed a Polars column of sequences
+
+    AlphaGenome embeddings per sequence:
+
+    | Column | Shape | Type |
+    |---|---|---|
+    | `embeddings_1bp` | `(window_bp, 1536)` | `fixed_shape_tensor(float16)` |
+    | `embeddings_128bp` | `(1024, 3072)` | `fixed_shape_tensor(float16)` |
+    | `embeddings_pair` | `(64, 64, 128)` | `fixed_shape_tensor(float16)` |
+
+    **In-memory mode** (default): mean-pooled 1bp and 128bp vectors are appended
+    as `pl.Array(Float16, D)` columns on the returned DataFrame.
+
+    **Lance mode** (`lance_out` path): every batch is written to a Lance dataset
+    incrementally as it completes — nothing accumulates in RAM. Full embedding
+    arrays are stored as `pa.fixed_shape_tensor` columns alongside all original
+    df columns and a `row_idx` int32 key.
+    """)
+    return
+
+
+@app.cell
+def _(BASE_URL, decode, np, requests):
+    import math
+    import threading
+    import polars as pl
+
+    def _make_tensor_col(arrays: list, pa) -> "pa.ChunkedArray":
+        """Stack a list of float16 ndarrays into a pa.fixed_shape_tensor column."""
+        mat = np.stack(arrays)  # (batch, *shape)
+        tensor_type = pa.fixed_shape_tensor(pa.float16(), mat.shape[1:])
+        storage = pa.FixedSizeListArray.from_arrays(
+            pa.array(mat.ravel().tolist(), type=pa.float16()),
+            int(np.prod(mat.shape[1:])),
+        )
+        return pa.field("_", tensor_type), pa.ExtensionArray.from_storage(tensor_type, storage)
+
+    def embed_dataframe(
+        df: pl.DataFrame,
+        seq_col: str,
+        *,
+        base_url: str = BASE_URL,
+        batch_size: int = 4,
+        max_workers: int = 8,
+        resolution: int = 1,
+        window_bp: int = 10_000,
+        organism: str = "human",
+        npy_out: str | None = None,
+        lance_out: str | None = None,
+    ) -> pl.DataFrame:
+        """Compute AlphaGenome embeddings for every sequence in `seq_col`.
+
+        Batches are dispatched concurrently (up to `max_workers` in-flight at
+        once) so multiple Modal containers are used in parallel.
+
+        Args:
+            df:          Input DataFrame. Must contain `seq_col`.
+            seq_col:     Name of the column holding DNA sequences (str).
+            base_url:    Modal service URL.
+            batch_size:  Sequences per /embed-batch call.
+            max_workers: Max concurrent requests (= max containers used).
+                         Match to the service's `max_containers` setting.
+            resolution:  1 or 128 (passed to the service).
+            window_bp:   1bp crop window size; only used when resolution=1.
+            organism:    'human' or 'mouse'.
+            npy_out:     If given, full 1bp embeddings are saved to this path
+                         (shape N x window_bp x 1536, float16) with a `npy_row`
+                         column added to the returned DataFrame.
+            lance_out:   If given, full embeddings are written incrementally to
+                         a Lance dataset at this path as each batch completes.
+                         Nothing accumulates in RAM. Columns written per row:
+                           - `embeddings_1bp`  fixed_shape_tensor(float16, (window_bp, 1536))
+                           - `embeddings_128bp` fixed_shape_tensor(float16, (1024, 3072))
+                           - `embeddings_pair`  fixed_shape_tensor(float16, (64, 64, 128))
+                         Plus all original df columns and `row_idx` int32.
+                         Returns the original df unchanged.
+
+        Returns:
+            In-memory mode: original DataFrame with embedding columns appended:
+              - `emb_1bp_mean`   pl.Array(Float16, 1536)   [if resolution in (1, None)]
+              - `emb_128bp_mean` pl.Array(Float16, 3072)   [if resolution in (128, None)]
+              - `npy_row`        pl.UInt32                 [if npy_out is set]
+            Lance mode (lance_out set): original DataFrame unchanged.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        sequences = df[seq_col].to_list()
+        n = len(sequences)
+        n_batches = math.ceil(n / batch_size)
+
+        # Build all batch payloads upfront, keyed by batch index
+        batches = []
+        for b in range(n_batches):
+            batch = sequences[b * batch_size : (b + 1) * batch_size]
+            payload = {"sequences": batch, "organism": organism, "resolution": resolution}
+            if resolution == 1:
+                payload["window_bp"] = window_bp
+            batches.append((b, batch, payload))
+
+        def _call(args):
+            b, _, payload = args
+            resp = requests.post(f"{base_url}/embed-batch", json=payload, timeout=600)
+            resp.raise_for_status()
+            return b, resp.json()["results"]
+
+        if lance_out is not None:
+            import lance
+            import pyarrow as pa
+
+            _lance_lock = threading.Lock()
+            _lance_initialized = [False]
+
+            def _write_to_lance(b: int, results: list):
+                start_row = b * batch_size
+                table = df.slice(start_row, len(results)).to_arrow()
+                table = table.append_column(
+                    pa.field("row_idx", pa.int32()),
+                    pa.array(range(start_row, start_row + len(results)), type=pa.int32()),
+                )
+
+                emb_1bp, emb_128bp, emb_pair = [], [], []
+                for item_dict in results:
+                    if "embeddings_1bp" in item_dict:
+                        emb_1bp.append(decode(item_dict["embeddings_1bp"])[0].astype(np.float16))    # (W, 1536)
+                    if "embeddings_128bp" in item_dict:
+                        emb_128bp.append(decode(item_dict["embeddings_128bp"])[0].astype(np.float16))  # (1024, 3072)
+                    if "embeddings_pair" in item_dict:
+                        emb_pair.append(decode(item_dict["embeddings_pair"])[0].astype(np.float16))  # (64, 64, 128)
+
+                for col_name, arrays in [
+                    ("embeddings_1bp", emb_1bp),
+                    ("embeddings_128bp", emb_128bp),
+                    ("embeddings_pair", emb_pair),
+                ]:
+                    if arrays:
+                        _, col_arr = _make_tensor_col(arrays, pa)
+                        mat = np.stack(arrays)
+                        tensor_type = pa.fixed_shape_tensor(pa.float16(), mat.shape[1:])
+                        table = table.append_column(pa.field(col_name, tensor_type), col_arr)
+
+                with _lance_lock:
+                    mode = "create" if not _lance_initialized[0] else "append"
+                    lance.write_dataset(table, lance_out, mode=mode)
+                    _lance_initialized[0] = True
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_call, args): args[0] for args in batches}
+                for fut in as_completed(futures):
+                    b, results = fut.result()
+                    _write_to_lance(b, results)
+                    print(f"  batch {b + 1}/{n_batches} done ({len(batches[b][1])} seqs) -> lance")
+
+            print(f"Lance dataset written to {lance_out}")
+            return df
+
+        # --- in-memory path ---
+        # Dispatch concurrently; collect results indexed by batch position
+        batch_results = [None] * n_batches
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_call, args): args[0] for args in batches}
+            for fut in as_completed(futures):
+                b, results = fut.result()
+                batch_results[b] = results
+                print(f"  batch {b + 1}/{n_batches} done ({len(batches[b][1])} seqs)")
+
+        # Flatten in original sequence order
+        mean_1bp_rows = []
+        mean_128bp_rows = []
+        full_1bp_chunks = []
+
+        for results in batch_results:
+            for item_dict in results:
+                if "embeddings_1bp" in item_dict:
+                    arr = decode(item_dict["embeddings_1bp"])  # (1, W, 1536)
+                    arr = arr[0].astype(np.float16)            # (W, 1536)
+                    mean_1bp_rows.append(arr.mean(axis=0))     # (1536,)
+                    if npy_out is not None:
+                        full_1bp_chunks.append(arr[np.newaxis])
+
+                if "embeddings_128bp" in item_dict:
+                    arr = decode(item_dict["embeddings_128bp"])  # (1, 1024, 3072)
+                    arr = arr[0].astype(np.float16)              # (1024, 3072)
+                    mean_128bp_rows.append(arr.mean(axis=0))     # (3072,)
+
+        new_cols: dict[str, pl.Series] = {}
+
+        if mean_1bp_rows:
+            stacked = np.stack(mean_1bp_rows)  # (N, 1536)
+            new_cols["emb_1bp_mean"] = pl.Series(
+                "emb_1bp_mean",
+                stacked.tolist(),
+                dtype=pl.Array(pl.Float16, stacked.shape[1]),
+            )
+
+        if mean_128bp_rows:
+            stacked = np.stack(mean_128bp_rows)  # (N, 3072)
+            new_cols["emb_128bp_mean"] = pl.Series(
+                "emb_128bp_mean",
+                stacked.tolist(),
+                dtype=pl.Array(pl.Float16, stacked.shape[1]),
+            )
+
+        if npy_out is not None and full_1bp_chunks:
+            full = np.concatenate(full_1bp_chunks, axis=0)  # (N, W, 1536)
+            np.save(npy_out, full)
+            print(f"Saved full 1bp embeddings -> {npy_out}  shape={full.shape}")
+            new_cols["npy_row"] = pl.Series("npy_row", list(range(n)), dtype=pl.UInt32)
+
+        return df.with_columns([v for v in new_cols.values()])
+
+    return embed_dataframe, pl
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
+def _():
+    import duckdb
+
+
+    return (duckdb,)
+
+
+@app.cell
+def _():
+    import os
+    os.listdir('..')
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
+def _():
+
+    # dataset = lance.dataset("../demo_embeddings.lance")
+    # results = dataset.to_table()
+    # conn = duckdb.connect()
+    # conn.execute("INSTALL lance; LOAD lance;")
+    # conn.register("embeddings", results)
+
+    # db = lancedb.connect("demo_embeddings.lance")
+    # duckdb.query("SELECT * FROM 'demo_embeddings.lance' LIMIT 1").to_df()
+
+    # table = db.open_table("my_table")
+
+
+    # conn.query("""
+    # SELECT *
+    # FROM embeddings
+    # LIMIT 1
+    # """)
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
+def _(embed_dataframe, pl):
+    demo_df = pl.DataFrame({
+        "name":     ["seq_A", "seq_B", "seq_C", "seq_D", "seq_E", "seq_F"]*100,
+        "sequence": ["ATCG" * 512, "GCTA" * 512, "TTAA" * 512,
+                     "CCGG" * 512, "AATT" * 512, "GGCC" * 512]*100,
+    })
+
+    result_df = embed_dataframe(
+        demo_df,
+        seq_col="sequence",
+        batch_size=3,
+        resolution=1,
+        window_bp=10_000,
+        max_workers=10,
+        lance_out="demo_embeddings3.lance",
     )
-    r_batch.raise_for_status()
-    t_batch = time.time() - t0
-    batch_results = r_batch.json()["results"]
+
+    # print(result_df.select(["name", "emb_1bp_mean"]))
+    return (result_df,)
+
+
+@app.cell
+def _(result_df):
+    result_df
+    return
+
+
+@app.cell
+def _():
+    import lance
+
+    ds = lance.dataset("demo_embeddings.lance")
+    print(ds.schema)
+    print(f"{ds.count_rows()} rows")
+    return ds, lance
+
+
+@app.cell
+def _(lance):
+    import lancedb
+    db1 = lancedb.connect("./")
+    print(db1.list_tables())
+    table = db1.open_table("demo_embeddings3")
+    dataset1 = lance.dataset("demo_embeddings3.lance")
+    result1 = dataset1.scanner(
+        filter="name == 'seq_A'",
+        columns=None,
+        limit = 1
+    ).to_table()
+    return
+
+
+@app.cell
+def _(duckdb, lance, my_table):
+    dataset = lance.dataset("demo_embeddings3.lance")
+
+    # Register and query with DuckDB
+    duckdb.register("my_table", dataset)
+    result = duckdb.sql("SELECT * FROM my_table LIMIT 10").df()
+    return
+
+
+@app.cell
+def _(ds, pl):
+    # Read all rows back, sorted by row_idx to match original df order
+    tbl = pl.from_arrow(ds.to_table()).sort("row_idx")
+    tbl.select(["name", "row_idx", "emb_1bp_mean"])
+    return
+
+
+@app.cell
+def _(ds, pl):
+    # Filter to a single name
+    tbl_filtered = pl.from_arrow(
+        ds.to_table(filter="name = 'seq_A'")
+    ).sort("row_idx")
+    tbl_filtered.select(["name", "row_idx", "emb_1bp_mean"])
+    return
+
+
+@app.cell
+def _():
+    # import lancedb
+
+    # db = lancedb.connect(".")
+    # lance_tbl = db.open_table("demo_embeddings")
+
+    # # Brute-force nearest-neighbour search on emb_1bp_mean
+    # query_vec = np.zeros(1536, dtype=np.float32)
+    # hits = (
+    #     lance_tbl.search(query_vec, vector_column_name="emb_1bp_mean")
+    #     .limit(5)
+    #     .to_arrow()
+    # )
+    # pl.from_arrow(hits).select(["name", "row_idx", "_distance"])
     return
 
 
