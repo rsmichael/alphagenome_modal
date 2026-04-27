@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "modal-alphagenome"
+version = "0.1.0"
+description = "AlphaGenome inference microservice and training pipeline using Modal"
+requires-python = ">=3.12"
+dependencies = [
+    "modal",
+    "polars",
+    "numpy",
+    "requests",
+    "zstandard",
+    "pyarrow",
+    "pylance",
+    "lancedb"
+]

@@ -22,6 +22,7 @@ pydantic = "*"
 marimo = "*"
 requests = "*"
 alphagenome-pytorch = { path = "./alphagenome-pytorch", editable = true }
+modal-alphagenome = { path = ".", editable = true }
 pybigwig = "*"
 pandas = "*"
 tqdm = "*"
