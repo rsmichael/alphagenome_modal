@@ -272,10 +272,12 @@ class EmbedBatchRequest(BaseModel):
 
 
 def _pad(sequence: str) -> str:
-    """Pad with N or truncate to SEQ_LEN."""
-    if len(sequence) < SEQ_LEN:
-        return sequence + "N" * (SEQ_LEN - len(sequence))
-    return sequence[:SEQ_LEN]
+    """Center sequence in SEQ_LEN window, padding with N on both sides."""
+    if len(sequence) > SEQ_LEN:
+        raise ValueError(f"sequence length {len(sequence)} exceeds SEQ_LEN {SEQ_LEN}")
+    pad = SEQ_LEN - len(sequence)
+    left = pad // 2
+    return "N" * left + sequence + "N" * (pad - left)
 
 
 def _seq_to_gpu(sequences: list[str], onehot_lookup):
@@ -372,9 +374,11 @@ class AlphaGenomeService:
     # -------------------------------------------------------------------------
 
     def _pad(self, sequence: str) -> str:
-        if len(sequence) < SEQ_LEN:
-            return sequence + "N" * (SEQ_LEN - len(sequence))
-        return sequence[:SEQ_LEN]
+        if len(sequence) > SEQ_LEN:
+            raise ValueError(f"sequence length {len(sequence)} exceeds SEQ_LEN {SEQ_LEN}")
+        pad = SEQ_LEN - len(sequence)
+        left = pad // 2
+        return "N" * left + sequence + "N" * (pad - left)
 
     def _seq_to_gpu(self, sequences: list[str]):
         """Convert DNA strings to a GPU float32 one-hot tensor via ASCII lookup.
