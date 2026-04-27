@@ -26,7 +26,6 @@ image = (
         "lance",
         "lancedb",
         "pyarrow",
-        "duckdb",
     )
     .run_commands(
         "git clone https://github.com/genomicsxai/alphagenome-pytorch /root/alphagenome-pytorch",
