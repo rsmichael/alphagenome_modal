@@ -737,10 +737,10 @@ def _(embed_dataframe, embed_to_volume, pl):
 
     _t0 = _time.time()
     embed_to_volume(_demo_df, "sequence", f"demo_timing_volume_{str(_t0)}",
-                    batch_size=3, resolution=1, window_bp=10_000, max_workers=10)
+                    batch_size=3, resolution=1, window_bp=32768*4, max_workers=10)
     _t_vol_10k = _time.time() - _t0
 
-    print(f"\nHTTP + local Lance:  {_t_http:.1f}s, 10k context output: {_t_http_10k:.1f}s")
+    # print(f"\nHTTP + local Lance:  {_t_http:.1f}s, 10k context output: {_t_http_10k:.1f}s")
     print(f"Modal volume Lance: {_t_vol:.1f}s, 10k context output: {_t_vol_10k:.1f}s")
     return
 
