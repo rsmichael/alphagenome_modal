@@ -8,3 +8,7 @@ __pycache__/
 
 # Modal
 .modal/
+
+# Lance
+
+*lance/*
