@@ -157,8 +157,8 @@ class EmbedRequest(BaseModel):
     center_pos: Optional[int] = Field(
         default=None,
         description=(
-            "Center position (0-based) within the sequence for the 1bp crop window. "
-            "Required when resolution=1 and window_bp is set. "
+            "Center position (0-based) within the original, unpadded sequence for the 1bp crop window. "
+            "Sequence-relative: 0 = first base of the input sequence. "
             "Defaults to the middle of the sequence."
         ),
     )
@@ -221,7 +221,7 @@ class EmbedBatchRequest(BaseModel):
     )
     center_pos: Optional[int] = Field(
         default=None,
-        description="Center position (0-based) for 1bp crop. Defaults to sequence midpoint.",
+        description="Center position (0-based) within the original, unpadded sequence for 1bp crop. Sequence-relative: 0 = first base of the input sequence. Defaults to sequence midpoint.",
     )
     window_bp: Optional[int] = Field(
         default=None,
@@ -506,7 +506,11 @@ class AlphaGenomeService:
             with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=use_amp):
                 emb = self.model.encode(dna, org, resolutions=resolutions)
 
-        emb = self._crop_1bp(emb, req.resolution, req.window_bp, req.center_pos)
+        center_pos = req.center_pos
+        if center_pos is not None:
+            pad_left = (SEQ_LEN - len(req.sequence)) // 2
+            center_pos = pad_left + center_pos
+        emb = self._crop_1bp(emb, req.resolution, req.window_bp, center_pos)
         return {key: _tensor_to_encoded(val) for key, val in emb.items()}
 
     def _run_embed_batch(self, req: EmbedBatchRequest) -> dict:
@@ -522,18 +526,27 @@ class AlphaGenomeService:
             with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=use_amp):
                 emb = self.model.encode(dna, org, resolutions=resolutions)
 
-        emb = self._crop_1bp(emb, req.resolution, req.window_bp, req.center_pos)
+        if req.center_pos is not None:
+            results = []
+            for i, seq in enumerate(req.sequences):
+                pad_left = (SEQ_LEN - len(seq)) // 2
+                buf_center = pad_left + req.center_pos
+                single_emb = {k: v[i:i+1] for k, v in emb.items()}
+                single_emb = self._crop_1bp(single_emb, req.resolution, req.window_bp, buf_center)
+                results.append({k: _tensor_to_encoded(v) for k, v in single_emb.items()})
+        else:
+            emb = self._crop_1bp(emb, req.resolution, req.window_bp, None)
 
-        # Move all tensors to CPU once, then encode in parallel across sequences.
-        B = len(req.sequences)
-        cpu_emb = {key: val.detach().cpu() for key, val in emb.items()}
+            # Move all tensors to CPU once, then encode in parallel across sequences.
+            B = len(req.sequences)
+            cpu_emb = {key: val.detach().cpu() for key, val in emb.items()}
 
-        def _encode_seq(i):
-            return {key: _tensor_to_encoded(t[i : i + 1]) for key, t in cpu_emb.items()}
+            def _encode_seq(i):
+                return {key: _tensor_to_encoded(t[i : i + 1]) for key, t in cpu_emb.items()}
 
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=B) as pool:
-            results = list(pool.map(_encode_seq, range(B)))
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=B) as pool:
+                results = list(pool.map(_encode_seq, range(B)))
 
         return {"results": results}
 
