@@ -50,6 +50,7 @@ def embed_dataframe(
     organism: str = "human",
     npy_out: Optional[str] = None,
     lance_out: Optional[str] = None,
+    lance_write_mode: str = "overwrite",
 ) -> pl.DataFrame:
     """Compute AlphaGenome embeddings for every sequence in `seq_col` via HTTP.
 
@@ -66,8 +67,12 @@ def embed_dataframe(
         window_bp:   1bp crop window; only used when resolution=1.
         organism:    'human' or 'mouse'.
         npy_out:     If given, full 1bp embeddings saved here as (N, W, 1536) float16.
-        lance_out:   If given, full embeddings written incrementally to a local Lance
-                     dataset at this path. Nothing accumulates in RAM. Returns df unchanged.
+        lance_out:        If given, full embeddings written incrementally to a local Lance
+                          dataset at this path. Nothing accumulates in RAM. Returns df unchanged.
+        lance_write_mode: How to handle an existing Lance dataset at `lance_out`.
+                          'overwrite' (default) replaces data but keeps Lance version history.
+                          'append' adds rows (use for growing datasets; dedup by embedded_at).
+                          'fail' raises an error if the dataset already exists.
 
     Returns:
         In-memory mode: df with columns appended:
@@ -95,9 +100,16 @@ def embed_dataframe(
         return b, resp.json()["results"]
 
     if lance_out is not None:
+        if lance_write_mode not in ("overwrite", "append", "fail"):
+            raise ValueError(
+                f"lance_write_mode must be 'overwrite', 'append', or 'fail', got {lance_write_mode!r}"
+            )
+
         import lance
         import pyarrow as pa
+        from datetime import datetime, timezone
 
+        _embed_ts = datetime.now(timezone.utc)
         _lance_lock = threading.Lock()
         _lance_initialized = [False]
 
@@ -107,6 +119,10 @@ def embed_dataframe(
             table = table.append_column(
                 pa.field("row_idx", pa.int32()),
                 pa.array(range(start_row, start_row + len(results)), type=pa.int32()),
+            )
+            table = table.append_column(
+                pa.field("embedded_at", pa.timestamp("us", tz="UTC")),
+                pa.array([_embed_ts] * len(results), type=pa.timestamp("us", tz="UTC")),
             )
 
             emb_1bp, emb_128bp, emb_pair = [], [], []
@@ -128,7 +144,15 @@ def embed_dataframe(
                     table = table.append_column(pa.field(col_name, tensor_type), col_arr)
 
             with _lance_lock:
-                mode = "create" if not _lance_initialized[0] else "append"
+                if not _lance_initialized[0]:
+                    if lance_write_mode == "overwrite":
+                        mode = "overwrite"
+                    elif lance_write_mode == "append":
+                        mode = "append"
+                    else:  # "fail"
+                        mode = "create"
+                else:
+                    mode = "append"
                 lance.write_dataset(table, lance_out, mode=mode)
                 _lance_initialized[0] = True
 
