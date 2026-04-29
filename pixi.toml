@@ -1,5 +1,5 @@
 [workspace]
-name = "modal_alphagenome"
+name = "alphagenome_modal"
 version = "0.1.0"
 description = "Alphagenome inference microservice and training pipeline using Modal"
 channels = ["conda-forge"]
@@ -22,7 +22,7 @@ pydantic = "*"
 marimo = "*"
 requests = "*"
 alphagenome-pytorch = { path = "./alphagenome-pytorch", editable = true }
-modal-alphagenome = { path = ".", editable = true }
+alphagenome-modal = { path = ".", editable = true }
 pybigwig = "*"
 pandas = "*"
 tqdm = "*"
@@ -34,15 +34,15 @@ pyarrow = "*"
 dna-parser = "*"
 
 [tasks]
-modal-run = "modal run -m modal_alphagenome.app"
-modal-deploy = "modal deploy -m modal_alphagenome.app"
-modal-shell = "modal shell -m modal_alphagenome.app"
-test-download = "modal run -m modal_alphagenome.download_test"
-setup-model = "modal run -m modal_alphagenome.model_setup"
-convert-weights = "modal run -m modal_alphagenome.model_setup::convert_to_pytorch"
-serve-temp = "modal serve -m modal_alphagenome.inference"
-serve-deploy = "modal deploy -m modal_alphagenome.inference"
-serve-torch-temp = "modal serve -m modal_alphagenome.inference_agtorch"
-serve-torch-deploy = "modal deploy -m modal_alphagenome.inference_agtorch"
-embed-lance-serve = "modal serve -m modal_alphagenome.embed_to_lance"
-embed-lance-deploy = "modal deploy -m modal_alphagenome.embed_to_lance"
+modal-run = "modal run -m alphagenome_modal.app"
+modal-deploy = "modal deploy -m alphagenome_modal.app"
+modal-shell = "modal shell -m alphagenome_modal.app"
+test-download = "modal run -m alphagenome_modal.download_test"
+setup-model = "modal run -m alphagenome_modal.model_setup"
+convert-weights = "modal run -m alphagenome_modal.model_setup::convert_to_pytorch"
+serve-temp = "modal serve -m alphagenome_modal.inference"
+serve-deploy = "modal deploy -m alphagenome_modal.inference"
+serve-torch-temp = "modal serve -m alphagenome_modal.inference_agtorch"
+serve-torch-deploy = "modal deploy -m alphagenome_modal.inference_agtorch"
+embed-lance-serve = "modal serve -m alphagenome_modal.embed_to_lance"
+embed-lance-deploy = "modal deploy -m alphagenome_modal.embed_to_lance"

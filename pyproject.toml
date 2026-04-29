@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "modal-alphagenome"
+name = "alphagenome-modal"
 version = "0.1.0"
 description = "AlphaGenome inference microservice and training pipeline using Modal"
 requires-python = ">=3.12"

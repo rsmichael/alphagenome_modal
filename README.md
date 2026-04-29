@@ -403,11 +403,11 @@ For more ontology terms, see the [Uberon Ontology](http://uberon.github.io/).
 ## Project Structure
 
 ```
-modal_alphagenome/
+alphagenome_modal/
 ├── pixi.toml                      # Pixi configuration and dependencies
 ├── README.md                      # This file
 ├── .gitignore                     # Git ignore rules
-└── modal_alphagenome/             # Main Python package
+└── alphagenome_modal/             # Main Python package
     ├── __init__.py                # Package initialization
     ├── app.py                     # Basic Modal hello world app
     ├── download_test.py           # CPU-only HuggingFace auth test
